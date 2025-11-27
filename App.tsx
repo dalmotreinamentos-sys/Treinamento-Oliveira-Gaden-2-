@@ -20,7 +20,8 @@ import {
   X,
   Camera,
   Upload,
-  RefreshCw
+  RefreshCw,
+  Database
 } from 'lucide-react';
 import { Plant, LightRequirement, UserProgress, QuizQuestion, StudySession } from './types';
 import { PLANT_DATABASE } from './constants';
@@ -28,7 +29,75 @@ import { PLANT_DATABASE } from './constants';
 // --- Services & Helpers ---
 
 const PROGRESS_KEY = 'oliveira_garden_progress_v1';
-const CUSTOM_IMAGES_KEY = 'oliveira_garden_custom_images_v1';
+const OLD_CUSTOM_IMAGES_KEY = 'oliveira_garden_custom_images_v1'; // Keeping for migration
+
+// --- IndexedDB Configuration ---
+const DB_NAME = 'OliveiraGardenDB';
+const STORE_NAME = 'custom_images';
+const DB_VERSION = 1;
+
+// IDB Helper Functions
+const initDB = (): Promise<IDBDatabase> => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME);
+      }
+    };
+  });
+};
+
+const getAllStoredImages = async (): Promise<Record<string, string>> => {
+  try {
+    const db = await initDB();
+    return new Promise((resolve, reject) => {
+      const transaction = db.transaction(STORE_NAME, 'readonly');
+      const store = transaction.objectStore(STORE_NAME);
+      const request = store.openCursor();
+      const images: Record<string, string> = {};
+      
+      request.onsuccess = (event) => {
+        const cursor = (event.target as IDBRequest).result;
+        if (cursor) {
+          images[cursor.key as string] = cursor.value;
+          cursor.continue();
+        } else {
+          resolve(images);
+        }
+      };
+      request.onerror = () => reject(request.error);
+    });
+  } catch (e) {
+    console.error("Error accessing IndexedDB:", e);
+    return {};
+  }
+};
+
+const storeImageInDB = async (id: string, dataUrl: string): Promise<void> => {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.put(dataUrl, id);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+};
+
+const deleteImageFromDB = async (id: string): Promise<void> => {
+  const db = await initDB();
+  return new Promise((resolve, reject) => {
+    const transaction = db.transaction(STORE_NAME, 'readwrite');
+    const store = transaction.objectStore(STORE_NAME);
+    const request = store.delete(id);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error);
+  });
+};
 
 const getInitialProgress = (): UserProgress => {
   const stored = localStorage.getItem(PROGRESS_KEY);
@@ -47,7 +116,7 @@ const saveProgress = (progress: UserProgress) => {
   localStorage.setItem(PROGRESS_KEY, JSON.stringify(progress));
 };
 
-// Helper to compress images before saving to avoid LocalStorage quotas
+// Helper to compress images before saving to avoid Storage quotas (even IDB has limits, though higher)
 const compressImage = (file: File): Promise<string> => {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -57,7 +126,7 @@ const compressImage = (file: File): Promise<string> => {
       img.src = event.target?.result as string;
       img.onload = () => {
         const canvas = document.createElement('canvas');
-        const MAX_WIDTH = 600; // Limit width to 600px
+        const MAX_WIDTH = 800; // Increased quality slightly for IDB
         const scaleSize = MAX_WIDTH / img.width;
         
         // Only resize if bigger than max width
@@ -71,8 +140,8 @@ const compressImage = (file: File): Promise<string> => {
 
         const ctx = canvas.getContext('2d');
         ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
-        // Compress to JPEG quality 0.7
-        resolve(canvas.toDataURL('image/jpeg', 0.7));
+        // Compress to JPEG quality 0.75
+        resolve(canvas.toDataURL('image/jpeg', 0.75));
       };
       img.onerror = (err) => reject(err);
     };
@@ -80,21 +149,44 @@ const compressImage = (file: File): Promise<string> => {
   });
 };
 
-// Hook to manage plant database with custom overrides
+// Hook to manage plant database with custom overrides via IndexedDB
 const usePlantDatabase = () => {
   const [plants, setPlants] = useState<Plant[]>(PLANT_DATABASE);
   const [customImages, setCustomImages] = useState<Record<string, string>>({});
+  const [isLoadingImages, setIsLoadingImages] = useState(true);
 
+  // Load images from IDB on mount
   useEffect(() => {
-    const storedImages = localStorage.getItem(CUSTOM_IMAGES_KEY);
-    if (storedImages) {
+    const loadImages = async () => {
       try {
-        const parsed = JSON.parse(storedImages);
-        setCustomImages(parsed);
-      } catch (e) {
-        console.error("Failed to parse custom images", e);
+        // 1. Try to migrate old localStorage images if they exist
+        const oldStorage = localStorage.getItem(OLD_CUSTOM_IMAGES_KEY);
+        let migratedImages = {};
+        if (oldStorage) {
+          try {
+             migratedImages = JSON.parse(oldStorage);
+             console.log("Migrating images from LocalStorage to IndexedDB...");
+             for (const [id, url] of Object.entries(migratedImages)) {
+               await storeImageInDB(id, url as string);
+             }
+             // Clear old storage after successful migration loop start (safest to keep until confirmed but for now we just clear to free space)
+             localStorage.removeItem(OLD_CUSTOM_IMAGES_KEY);
+          } catch (e) {
+            console.error("Migration failed", e);
+          }
+        }
+
+        // 2. Load from IDB
+        const dbImages = await getAllStoredImages();
+        setCustomImages(dbImages);
+      } catch (error) {
+        console.error("Failed to load images from DB", error);
+      } finally {
+        setIsLoadingImages(false);
       }
-    }
+    };
+
+    loadImages();
   }, []);
 
   useEffect(() => {
@@ -109,25 +201,32 @@ const usePlantDatabase = () => {
   const updatePlantImage = async (plantId: string, file: File) => {
     try {
       const base64Image = await compressImage(file);
-      const newCustomImages = { ...customImages, [plantId]: base64Image };
-      setCustomImages(newCustomImages);
-      localStorage.setItem(CUSTOM_IMAGES_KEY, JSON.stringify(newCustomImages));
+      await storeImageInDB(plantId, base64Image);
+      
+      setCustomImages(prev => ({
+        ...prev,
+        [plantId]: base64Image
+      }));
       return true;
     } catch (e) {
       console.error("Error saving image", e);
-      alert("Erro ao salvar imagem. Tente uma foto menor.");
+      alert("Erro ao salvar imagem. Tente novamente.");
       return false;
     }
   };
 
-  const resetImage = (plantId: string) => {
-    const newCustomImages = { ...customImages };
-    delete newCustomImages[plantId];
-    setCustomImages(newCustomImages);
-    localStorage.setItem(CUSTOM_IMAGES_KEY, JSON.stringify(newCustomImages));
+  const resetImage = async (plantId: string) => {
+    try {
+      await deleteImageFromDB(plantId);
+      const newCustomImages = { ...customImages };
+      delete newCustomImages[plantId];
+      setCustomImages(newCustomImages);
+    } catch (e) {
+      console.error("Error deleting image", e);
+    }
   };
 
-  return { plants, updatePlantImage, resetImage };
+  return { plants, updatePlantImage, resetImage, isLoadingImages };
 };
 
 const getRandomPlantsFromList = (sourcePlants: Plant[], count: number): Plant[] => {
@@ -243,12 +342,20 @@ const HomePage = () => {
           <ChevronRight className="text-gray-400 group-hover:text-emerald-600" />
         </Link>
       </div>
+
+      <div className="mt-8 bg-emerald-50 p-4 rounded-lg border border-emerald-100 text-sm text-emerald-800 flex items-start gap-2">
+        <Database size={16} className="mt-0.5 flex-shrink-0" />
+        <p>
+          <strong>Nota sobre as fotos:</strong> As fotos que você adicionar ficarão salvas no seu navegador atual. 
+          Se trocar de celular ou limpar os dados de navegação, elas serão apagadas.
+        </p>
+      </div>
     </div>
   );
 };
 
 const CyclePage = () => {
-  const { plants } = usePlantDatabase();
+  const { plants, isLoadingImages } = usePlantDatabase();
   const [sessionPlants, setSessionPlants] = useState<Plant[]>([]);
   const [currentIndex, setCurrentIndex] = useState(0);
   const [showDetails, setShowDetails] = useState(false);
@@ -256,14 +363,14 @@ const CyclePage = () => {
   const [isActive, setIsActive] = useState(false);
   const [isFinished, setIsFinished] = useState(false);
   
-  // Initialize cycle
+  // Initialize cycle once images are loaded
   useEffect(() => {
-    if (plants.length > 0) {
+    if (!isLoadingImages && plants.length > 0) {
       const selected = getRandomPlantsFromList(plants, 2);
       setSessionPlants(selected);
       setIsActive(true);
     }
-  }, [plants]); // Depend on plants so if custom image updates, it reflects (though usually we start new session)
+  }, [isLoadingImages, plants]); // Re-run if plants update (e.g. image loads late), but mainly on mount
 
   // Timer logic
   useEffect(() => {
@@ -315,7 +422,16 @@ const CyclePage = () => {
     return `${m}:${s < 10 ? '0' : ''}${s}`;
   };
 
-  if (sessionPlants.length === 0) return <div>Carregando plantas...</div>;
+  if (isLoadingImages || sessionPlants.length === 0) {
+    return (
+      <div className="flex items-center justify-center h-64 text-emerald-600">
+        <div className="flex flex-col items-center gap-2">
+          <div className="w-8 h-8 border-4 border-emerald-200 border-t-emerald-600 rounded-full animate-spin"></div>
+          <p>Preparando ciclo...</p>
+        </div>
+      </div>
+    );
+  }
 
   if (isFinished) {
     return (
@@ -435,9 +551,7 @@ const StudyPage = () => {
       setIsUploading(true);
       const success = await updatePlantImage(plant.id, e.target.files[0]);
       if (success) {
-        // Just clear the selection for a split second to refresh (in a real context app this would update auto)
-        // Since we are using a hook in the parent, plants array updates, passing down.
-        // We just need to ensure the selectedPlant state also reflects the new URL.
+        // Just clear the selection for a split second to refresh
         const reader = new FileReader();
         reader.onload = (ev) => {
             setSelectedPlant(prev => prev ? { ...prev, imageUrl: ev.target?.result as string } : null);
@@ -473,8 +587,10 @@ const StudyPage = () => {
                {hasCustomImage && (
                  <button 
                    onClick={() => {
-                     resetImage(selectedPlant.id);
-                     setSelectedPlant(prev => prev ? {...prev, imageUrl: PLANT_DATABASE.find(p => p.id === prev.id)?.imageUrl || ''} : null);
+                     if(window.confirm("Deseja realmente remover sua foto e voltar para a original?")) {
+                       resetImage(selectedPlant.id);
+                       setSelectedPlant(prev => prev ? {...prev, imageUrl: PLANT_DATABASE.find(p => p.id === prev.id)?.imageUrl || ''} : null);
+                     }
                    }}
                    className="bg-red-500 text-white p-3 rounded-full shadow-lg hover:bg-red-600 transition-transform hover:scale-105"
                    title="Restaurar imagem original"
@@ -518,7 +634,7 @@ const StudyPage = () => {
 
             <div className="bg-blue-50 p-3 rounded-lg flex items-start gap-3 text-sm text-blue-800">
               <Upload size={16} className="mt-1 flex-shrink-0" />
-              <p>Dica: Clique no ícone de câmera na foto acima para enviar uma foto real desta planta da sua galeria ou câmera.</p>
+              <p>Dica: Clique no ícone de câmera na foto acima para enviar uma foto real desta planta.</p>
             </div>
 
             <button 
@@ -601,7 +717,7 @@ const StudyPage = () => {
 };
 
 const QuizPage = () => {
-  const { plants } = usePlantDatabase();
+  const { plants, isLoadingImages } = usePlantDatabase();
   const [questions, setQuestions] = useState<QuizQuestion[]>([]);
   const [currentQIndex, setCurrentQIndex] = useState(0);
   const [score, setScore] = useState(0);
@@ -610,10 +726,10 @@ const QuizPage = () => {
   const [isAnswered, setIsAnswered] = useState(false);
 
   useEffect(() => {
-    if (plants.length > 0) {
+    if (!isLoadingImages && plants.length > 0) {
         generateDailyQuiz();
     }
-  }, [plants]);
+  }, [isLoadingImages, plants]);
 
   const generateDailyQuiz = () => {
     const q1Plant = getRandomPlantsFromList(plants, 4); // 1 correct, 3 wrong
@@ -643,7 +759,7 @@ const QuizPage = () => {
       id: 3,
       type: 'PHOTO_TO_COMMON',
       questionText: "Qual o nome desta planta?",
-      imageUrl: q3Plant[0].imageUrl, // Will use custom image if set
+      imageUrl: q3Plant[0].imageUrl,
       correctAnswer: q3Plant[0].commonName,
       options: q3Plant.map(p => p.commonName).sort(() => Math.random() - 0.5)
     };
@@ -674,23 +790,16 @@ const QuizPage = () => {
   const finishQuiz = () => {
     setIsFinished(true);
     const progress = getInitialProgress();
-    const finalScore = score + (selectedOption === questions[currentQIndex].correctAnswer ? 1 : 0);
-    
-    // Fix: Ensure we don't double count if user clicks very fast, but here the state flow prevents it
-    // Actually simpler: incrementing score inside handleAnswer means score state is only accurate for PREVIOUS questions.
-    // The finish function runs on click "Ver Resultado".
-    // If we rely on state `score`, it might be lagging by one question if not careful, 
-    // BUT we update score in handleAnswer. By the time user clicks "Ver Resultado", re-render happened, score is up to date.
     
     saveProgress({
       ...progress,
       quizTotalQuestions: progress.quizTotalQuestions + 3,
-      quizCorrectAnswers: progress.quizCorrectAnswers + score, // Score state is updated
+      quizCorrectAnswers: progress.quizCorrectAnswers + score + (selectedOption === questions[currentQIndex].correctAnswer ? 1 : 0),
       history: [...progress.history, { date: new Date().toISOString().split('T')[0], type: 'QUIZ', score: score }]
     });
   };
 
-  if (questions.length === 0) return <div>Carregando Quiz...</div>;
+  if (isLoadingImages || questions.length === 0) return <div>Carregando Quiz...</div>;
 
   if (isFinished) {
     return (
